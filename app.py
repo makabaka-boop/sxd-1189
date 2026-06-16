@@ -88,24 +88,171 @@ def parse_remake_flag(value):
         return 1
     return 0
 
-def parse_date_smart(series):
-    parsed = pd.to_datetime(series, errors='coerce', infer_datetime_format=True)
-    if parsed.notna().sum() > 0:
-        return parsed
-    formats = [
-        '%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d', '%Y%m%d',
-        '%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S',
-        '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y',
-        '%Y年%m月%d日', '%Y年%m月%d'
-    ]
-    for fmt in formats:
+DATE_FORMATS = [
+    '%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S', '%Y.%m.%d %H:%M:%S',
+    '%Y-%m-%d %H:%M', '%Y/%m/%d %H:%M', '%Y.%m.%d %H:%M',
+    '%Y-%m-%d %I:%M %p', '%Y/%m/%d %I:%M %p',
+    '%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d',
+    '%Y%m%d',
+    '%Y年%m月%d日', '%Y年%m月%d', '%y年%m月%d日',
+    '%m/%d/%Y %H:%M:%S', '%m-%d-%Y %H:%M:%S',
+    '%m/%d/%Y %H:%M', '%m-%d-%Y %H:%M',
+    '%m/%d/%Y', '%m-%d-%Y',
+    '%m/%d/%y', '%m-%d-%y',
+    '%d/%m/%Y', '%d-%m-%Y',
+    '%d/%m/%y', '%d-%m-%y',
+]
+
+def _try_parse_date(value, formats, preferred_order=None):
+    if pd.isna(value):
+        return pd.NaT
+    s = str(value).strip()
+    if not s or s.lower() in ['nan', 'none', 'nat', '-', '--', 'null', '']:
+        return pd.NaT
+    s = s.replace('：', ':').replace('　', ' ').replace('  ', ' ')
+
+    ordered_formats = formats
+    if preferred_order:
+        year_first = []
+        month_first = []
+        day_first = []
+        other = []
+        for fmt in formats:
+            if fmt.startswith('%Y') or fmt.startswith('%y'):
+                year_first.append(fmt)
+            elif fmt.startswith('%m') or fmt.startswith('%M'):
+                if '%d' in fmt:
+                    month_first.append(fmt)
+                else:
+                    other.append(fmt)
+            elif fmt.startswith('%d'):
+                day_first.append(fmt)
+            else:
+                other.append(fmt)
+
+        if preferred_order == 'year_first':
+            ordered_formats = year_first + month_first + day_first + other
+        elif preferred_order == 'month_first':
+            ordered_formats = month_first + year_first + day_first + other
+        elif preferred_order == 'day_first':
+            ordered_formats = day_first + year_first + month_first + other
+
+    for fmt in ordered_formats:
         try:
-            parsed = pd.to_datetime(series, format=fmt, errors='coerce')
-            if parsed.notna().sum() >= (len(series) * 0.5):
-                return parsed
+            dt = datetime.strptime(s, fmt)
+            if dt.year < 2000 or dt.year > 2100:
+                continue
+            return pd.Timestamp(dt)
         except (ValueError, TypeError):
             continue
-    return pd.to_datetime(series, errors='coerce')
+
+    try:
+        parts = s.replace('/', '-').replace('.', '-').split('-')
+        if len(parts) == 3:
+            y, m, d = None, None, None
+            if len(parts[0]) == 4:
+                y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+            elif len(parts[2]) == 4:
+                if preferred_order == 'day_first':
+                    y, m, d = int(parts[2]), int(parts[1]), int(parts[0])
+                else:
+                    y, m, d = int(parts[2]), int(parts[0]), int(parts[1])
+                    if m > 12 or d > 31:
+                        y, m, d = int(parts[2]), int(parts[1]), int(parts[0])
+            if y and 1 <= m <= 12 and 1 <= d <= 31 and 2000 <= y <= 2100:
+                try:
+                    return pd.Timestamp(year=y, month=m, day=d)
+                except (ValueError, TypeError):
+                    pass
+    except (ValueError, TypeError, IndexError):
+        pass
+
+    try:
+        dayfirst_param = preferred_order == 'day_first'
+        dt = pd.to_datetime(s, errors='raise', dayfirst=dayfirst_param)
+        if 2000 <= dt.year <= 2100:
+            return pd.Timestamp(dt)
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        dt = pd.to_datetime(s, errors='raise', dayfirst=not (preferred_order == 'day_first'))
+        if 2000 <= dt.year <= 2100:
+            return pd.Timestamp(dt)
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        num = int(s)
+        dt = pd.to_datetime(num, unit='s', errors='raise')
+        if 2000 <= dt.year <= 2100:
+            return pd.Timestamp(dt)
+        dt = pd.to_datetime(num, unit='ms', errors='raise')
+        if 2000 <= dt.year <= 2100:
+            return pd.Timestamp(dt)
+    except (ValueError, TypeError, OverflowError):
+        pass
+
+    return pd.NaT
+
+def parse_date_smart(series):
+    non_null = series.dropna().astype(str)
+    if len(non_null) == 0:
+        return pd.Series([pd.NaT] * len(series), index=series.index, dtype='datetime64[ns]')
+
+    count_y_first = 0
+    count_m_first = 0
+    count_d_first = 0
+
+    for val in non_null.head(20):
+        s = val.strip()
+        if len(s) >= 10 and (s[:4].isdigit() or s[:5].replace('-', '').replace('/', '').isdigit()):
+            if s[:4].isdigit():
+                try:
+                    y = int(s[:4])
+                    if 2000 <= y <= 2100:
+                        count_y_first += 1
+                        continue
+                except ValueError:
+                    pass
+        if len(s) >= 8 and any(sep in s for sep in ['/', '-', '.']):
+            parts = s.replace('/', '-').replace('.', '-').split('-')
+            if len(parts) == 3:
+                try:
+                    p0, p1, p2 = int(parts[0]), int(parts[1]), int(parts[2])
+                    if len(parts[2]) == 4 and 2000 <= p2 <= 2100:
+                        is_possible_mmdd = (1 <= p0 <= 12) and (1 <= p1 <= 31)
+                        is_possible_ddmm = (1 <= p1 <= 12) and (1 <= p0 <= 31)
+                        is_definitely_mmdd = (p0 <= 12) and (p1 > 12)
+                        is_definitely_ddmm = (p1 <= 12) and (p0 > 12)
+
+                        if is_definitely_mmdd:
+                            count_m_first += 2
+                        elif is_definitely_ddmm:
+                            count_d_first += 2
+                        elif is_possible_mmdd and is_possible_ddmm:
+                            pass
+                        elif is_possible_mmdd:
+                            count_m_first += 1
+                        elif is_possible_ddmm:
+                            count_d_first += 1
+                except ValueError:
+                    pass
+
+    preferred_order = None
+    if count_y_first >= max(count_m_first, count_d_first, 1):
+        preferred_order = 'year_first'
+    elif count_m_first > count_d_first:
+        preferred_order = 'month_first'
+    elif count_d_first > count_m_first:
+        preferred_order = 'day_first'
+
+    result = []
+    for v in series:
+        dt = _try_parse_date(v, DATE_FORMATS, preferred_order)
+        result.append(dt)
+
+    return pd.Series(result, index=series.index, dtype='datetime64[ns]')
 
 def minute_to_hhmm(min_val):
     if pd.isna(min_val):
@@ -232,10 +379,162 @@ def filter_dataframe(df, date_range, stores, drinks, baristas, remake_only):
         mask &= df['is_remake']
     return df[mask].copy()
 
-def generate_html_report(df_filtered, df_raw, summary_metrics):
+def generate_html_report(df_filtered, df_raw, anomaly_df, summary_metrics, prep_suggestions):
     metrics_html = ""
     for k, v in summary_metrics.items():
         metrics_html += f'<div class="metric-card"><div class="metric-label">{k}</div><div class="metric-value">{v}</div></div>'
+
+    store_table = ""
+    drink_table = ""
+    barista_table = ""
+    anomaly_table = ""
+    suggestion_section = ""
+    daily_chart_data = ""
+    remake_chart_data = ""
+
+    valid_df = df_filtered.dropna(subset=['brew_duration', 'record_date_parsed'])
+
+    if len(valid_df) > 0:
+        store_stats = valid_df.groupby('store_name').agg(
+            订单数=('brew_duration', 'count'),
+            平均出杯时长=('brew_duration', 'mean'),
+            重做率=('is_remake', 'mean')
+        ).reset_index()
+        store_stats.columns = ['门店', '订单数', '平均时长(分)', '重做率(%)']
+        store_stats['平均时长(分)'] = store_stats['平均时长(分)'].apply(lambda x: f"{x:.1f}")
+        store_stats['重做率(%)'] = store_stats['重做率(%)'].apply(lambda x: f"{x*100:.1f}")
+        store_stats = store_stats.sort_values('订单数', ascending=False)
+        store_table = store_stats.to_html(index=False, classes='data-table')
+
+        drink_stats = df_filtered.groupby('drink_name').agg(
+            订单数=('is_remake', 'count'),
+            重做数=('is_remake', 'sum'),
+            重做率=('is_remake', 'mean')
+        ).reset_index()
+        drink_stats.columns = ['饮品', '订单数', '重做数', '重做率(%)']
+        drink_stats['重做率(%)'] = drink_stats['重做率(%)'].apply(lambda x: f"{x*100:.1f}")
+        drink_stats = drink_stats.sort_values('重做率(%)', ascending=False, key=lambda x: x.astype(float))
+        drink_table = drink_stats.to_html(index=False, classes='data-table')
+
+        barista_stats = valid_df.groupby('barista_name').agg(
+            出杯数=('brew_duration', 'count'),
+            平均出杯时长=('brew_duration', 'mean'),
+            重做率=('is_remake', 'mean')
+        ).reset_index()
+        barista_stats.columns = ['咖啡师', '出杯数', '平均时长(分)', '重做率(%)']
+        barista_stats['平均时长(分)'] = barista_stats['平均时长(分)'].apply(lambda x: f"{x:.1f}")
+        barista_stats['重做率(%)'] = barista_stats['重做率(%)'].apply(lambda x: f"{x*100:.1f}")
+        barista_stats = barista_stats.sort_values('出杯数', ascending=False)
+        barista_table = barista_stats.to_html(index=False, classes='data-table')
+
+        valid_dated = valid_df.copy()
+        valid_dated['date_only'] = valid_dated['record_date_parsed'].dt.date
+        daily_stats = valid_dated.groupby('date_only').agg(
+            平均出杯时长=('brew_duration', 'mean'),
+            订单量=('brew_duration', 'count'),
+            重做率=('is_remake', 'mean')
+        ).reset_index()
+        daily_stats = daily_stats.tail(14)
+        if len(daily_stats) > 0:
+            daily_labels = [str(d) for d in daily_stats['date_only'].tolist()]
+            daily_durations = [f"{x:.1f}" for x in daily_stats['平均出杯时长'].tolist()]
+            daily_volumes = daily_stats['订单量'].tolist()
+            daily_remakes = [f"{x*100:.1f}" for x in daily_stats['重做率'].tolist()]
+            daily_chart_data = f"""
+            <div class="chart-container">
+                <h3>📈 近14天效率趋势</h3>
+                <div class="chart-row">
+                    <div class="mini-chart">
+                        <div class="chart-title">平均出杯时长（分）</div>
+                        <div class="bar-chart">
+                            {''.join(f'<div class="bar-item" style="height:{min(100, float(v)*3)}%"><span class="bar-label">{v}</span></div>' for v in daily_durations)}
+                        </div>
+                        <div class="chart-labels">{' '.join(f'<span class="lbl">{l[5:]}</span>' for l in daily_labels)}</div>
+                    </div>
+                    <div class="mini-chart">
+                        <div class="chart-title">订单量</div>
+                        <div class="bar-chart">
+                            {''.join(f'<div class="bar-item green" style="height:{min(100, v*2)}%"><span class="bar-label">{v}</span></div>' for v in daily_volumes)}
+                        </div>
+                        <div class="chart-labels">{' '.join(f'<span class="lbl">{l[5:]}</span>' for l in daily_labels)}</div>
+                    </div>
+                    <div class="mini-chart">
+                        <div class="chart-title">重做率（%）</div>
+                        <div class="bar-chart">
+                            {''.join(f'<div class="bar-item red" style="height:{min(100, float(v)*5)}%"><span class="bar-label">{v}</span></div>' for v in daily_remakes)}
+                        </div>
+                        <div class="chart-labels">{' '.join(f'<span class="lbl">{l[5:]}</span>' for l in daily_labels)}</div>
+                    </div>
+                </div>
+            </div>
+            """
+
+    if len(df_filtered) > 0:
+        drink_remake = df_filtered.groupby('drink_name').agg(
+            订单数=('is_remake', 'count'),
+            重做率=('is_remake', 'mean')
+        ).reset_index()
+        drink_remake = drink_remake.sort_values('重做率', ascending=False).head(10)
+        if len(drink_remake) > 0:
+            remake_labels = drink_remake['drink_name'].tolist()
+            remake_values = [f"{x*100:.1f}" for x in drink_remake['重做率'].tolist()]
+            remake_orders = drink_remake['订单数'].tolist()
+            remake_chart_data = f"""
+            <div class="chart-container">
+                <h3>🔄 饮品重做率 Top 10</h3>
+                <div class="remake-list">
+                    {''.join(f'''
+                    <div class="remake-row">
+                        <span class="remake-name">{i+1}. {lbl}</span>
+                        <span class="remake-count">({ord}单)</span>
+                        <div class="remake-bar-bg">
+                            <div class="remake-bar {('warn' if float(val) > 15 else '')}" style="width:{min(100, float(val)*2)}%"></div>
+                        </div>
+                        <span class="remake-pct">{val}%</span>
+                    </div>
+                    ''' for i, (lbl, val, ord) in enumerate(zip(remake_labels, remake_values, remake_orders)))}
+                </div>
+            </div>
+            """
+
+    if len(anomaly_df) > 0:
+        anomaly_table = anomaly_df.to_html(index=False, classes='data-table anomaly-table')
+
+    if prep_suggestions:
+        suggestion_items = ""
+        for i, s in enumerate(prep_suggestions, 1):
+            suggestion_items += f"""
+            <div class="suggestion-card">
+                <div class="suggestion-title">建议 {i}：优化 [{s['饮品']}] 备料方案</div>
+                <div class="suggestion-metrics">
+                    <span class="chip">📦 订单量: {s['订单量']}</span>
+                    <span class="chip">⏱️ 时长: {s['平均出杯时长(分钟)']}分钟</span>
+                    <span class="chip">🔄 重做率: {s['重做率']}</span>
+                </div>
+                <div class="suggestion-content">
+                    <strong>问题点：</strong>{s['问题点']}<br>
+                    <strong>建议措施：</strong>{s['建议']}
+                </div>
+            </div>
+            """
+        suggestion_section = f"""
+        <h2>💡 备料调整建议</h2>
+        <div class="suggestion-grid">{suggestion_items}</div>
+        """
+
+    detail_table = ""
+    if len(df_filtered) > 0:
+        display_cols = [c for c in ['record_date', 'store_name', 'drink_name', 'barista_name',
+                                   'order_minute', 'finish_minute', 'brew_duration', 'remake_flag', 'note']
+                        if c in df_filtered.columns]
+        detail_df = df_filtered[display_cols].copy()
+        if 'brew_duration' in detail_df.columns:
+            detail_df['brew_duration'] = detail_df['brew_duration'].apply(
+                lambda x: f"{x:.1f}" if pd.notna(x) else ""
+            )
+        detail_table = detail_df.head(100).to_html(index=False, classes='data-table detail-table')
+        detail_count = len(df_filtered)
+        detail_note = f"<p style='color:#666;font-size:12px;margin-top:5px;'>* 显示前 100 条，共 {detail_count} 条记录</p>"
 
     html = f"""
     <!DOCTYPE html>
@@ -244,18 +543,55 @@ def generate_html_report(df_filtered, df_raw, summary_metrics):
         <meta charset="UTF-8">
         <title>咖啡门店出杯效率分析报告</title>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f8f9fa; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f8f9fa; color: #333; }}
             h1 {{ color: #8B4513; border-bottom: 3px solid #D2691E; padding-bottom: 10px; }}
-            h2 {{ color: #A0522D; margin-top: 30px; }}
+            h2 {{ color: #A0522D; margin-top: 35px; border-left: 4px solid #D2691E; padding-left: 12px; }}
+            h3 {{ color: #8B4513; margin-top: 20px; }}
             .metrics-container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
             .metric-card {{ background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-left: 4px solid #D2691E; }}
             .metric-label {{ color: #666; font-size: 14px; margin-bottom: 8px; }}
             .metric-value {{ color: #8B4513; font-size: 28px; font-weight: bold; }}
-            table {{ border-collapse: collapse; width: 100%; margin: 15px 0; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
-            th {{ background: #8B4513; color: white; padding: 12px; text-align: left; }}
-            td {{ padding: 10px 12px; border-bottom: 1px solid #eee; }}
-            tr:hover {{ background: #FFF8DC; }}
+            .data-table {{ border-collapse: collapse; width: 100%; margin: 15px 0; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border-radius: 8px; overflow: hidden; }}
+            .data-table th {{ background: #8B4513; color: white; padding: 12px; text-align: left; font-weight: 600; }}
+            .data-table td {{ padding: 10px 12px; border-bottom: 1px solid #eee; }}
+            .data-table tr:hover {{ background: #FFF8DC; }}
+            .anomaly-table th {{ background: #B22222; }}
+            .anomaly-table tr:hover {{ background: #FFE4E1; }}
+            .detail-table {{ font-size: 12px; }}
+            .detail-table th {{ padding: 8px 10px; }}
+            .detail-table td {{ padding: 6px 10px; }}
+            .chart-container {{ background: white; padding: 20px; border-radius: 10px; margin: 15px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
+            .chart-row {{ display: flex; gap: 20px; flex-wrap: wrap; }}
+            .mini-chart {{ flex: 1; min-width: 280px; }}
+            .chart-title {{ font-size: 13px; color: #666; margin-bottom: 8px; text-align: center; }}
+            .bar-chart {{ display: flex; align-items: flex-end; gap: 4px; height: 150px; padding: 10px 5px 0; border-bottom: 1px solid #eee; }}
+            .bar-item {{ flex: 1; background: linear-gradient(to top, #D2691E, #DEB887); border-radius: 4px 4px 0 0; position: relative; min-height: 4px; }}
+            .bar-item.green {{ background: linear-gradient(to top, #228B22, #90EE90); }}
+            .bar-item.red {{ background: linear-gradient(to top, #DC143C, #FFB6C1); }}
+            .bar-label {{ position: absolute; top: -18px; left: 50%; transform: translateX(-50%); font-size: 10px; color: #666; white-space: nowrap; }}
+            .chart-labels {{ display: flex; justify-content: space-between; margin-top: 5px; }}
+            .lbl {{ font-size: 10px; color: #999; }}
+            .remake-list {{ display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }}
+            .remake-row {{ display: flex; align-items: center; gap: 12px; }}
+            .remake-name {{ width: 140px; font-weight: 500; }}
+            .remake-count {{ color: #888; font-size: 12px; width: 50px; }}
+            .remake-bar-bg {{ flex: 1; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden; }}
+            .remake-bar {{ height: 100%; background: linear-gradient(to right, #FFA500, #FF6347); transition: width 0.3s; }}
+            .remake-bar.warn {{ background: linear-gradient(to right, #DC143C, #8B0000); }}
+            .remake-pct {{ width: 60px; text-align: right; font-weight: 600; }}
+            .suggestion-grid {{ display: grid; gap: 15px; margin: 15px 0; }}
+            .suggestion-card {{ background: white; padding: 18px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border-left: 4px solid #D2691E; }}
+            .suggestion-title {{ font-size: 16px; font-weight: 600; color: #8B4513; margin-bottom: 10px; }}
+            .suggestion-metrics {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }}
+            .chip {{ background: #FFF8DC; padding: 4px 10px; border-radius: 12px; font-size: 12px; color: #8B4513; }}
+            .suggestion-content {{ color: #555; line-height: 1.7; }}
+            .section-note {{ background: #E8F4FD; border-left: 4px solid #2196F3; padding: 12px 15px; margin: 15px 0; border-radius: 4px; color: #1565C0; }}
             .report-footer {{ margin-top: 40px; color: #999; font-size: 12px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }}
+            @media print {{
+                body {{ margin: 15px; }}
+                .data-table {{ page-break-inside: avoid; }}
+                .suggestion-card {{ page-break-inside: avoid; }}
+            }}
         </style>
     </head>
     <body>
@@ -266,17 +602,41 @@ def generate_html_report(df_filtered, df_raw, summary_metrics):
         <div class="metrics-container">{metrics_html}</div>
 
         <h2>📋 数据概览</h2>
-        <table>
-            <tr><th>项目</th><th>数值</th></tr>
+        <table class="data-table">
+            <tr><th style="width:40%">项目</th><th>数值</th></tr>
             <tr><td>总记录数</td><td>{len(df_raw)}</td></tr>
             <tr><td>筛选后记录数</td><td>{len(df_filtered)}</td></tr>
+            <tr><td>有效时长记录数</td><td>{len(valid_df)}</td></tr>
+            <tr><td>异常记录数</td><td>{len(anomaly_df)}</td></tr>
             <tr><td>涉及门店数</td><td>{df_filtered['store_name'].nunique() if len(df_filtered) > 0 else 0}</td></tr>
             <tr><td>涉及饮品数</td><td>{df_filtered['drink_name'].nunique() if len(df_filtered) > 0 else 0}</td></tr>
             <tr><td>涉及咖啡师数</td><td>{df_filtered['barista_name'].nunique() if len(df_filtered) > 0 else 0}</td></tr>
         </table>
 
+        {daily_chart_data}
+
+        {remake_chart_data}
+
+        <h2>🏪 门店统计</h2>
+        {store_table if store_table else '<div class="section-note">暂无有效门店数据</div>'}
+
+        <h2>🥤 饮品统计</h2>
+        {drink_table if drink_table else '<div class="section-note">暂无有效饮品数据</div>'}
+
+        <h2>👨‍🍳 咖啡师统计</h2>
+        {barista_table if barista_table else '<div class="section-note">暂无有效咖啡师数据</div>'}
+
+        {suggestion_section}
+
+        <h2>⚠️ 异常明细</h2>
+        {anomaly_table if anomaly_table else '<div class="section-note">✅ 未发现异常数据</div>'}
+
+        <h2>📋 明细数据</h2>
+        {detail_table if detail_table else '<div class="section-note">暂无明细数据</div>'}
+        {detail_note if detail_table else ''}
+
         <div class="report-footer">
-            本报告由咖啡门店出杯效率分析看板自动生成
+            本报告由咖啡门店出杯效率分析看板自动生成 | 数据仅保存在会话缓存中
         </div>
     </body>
     </html>
@@ -582,25 +942,46 @@ def main():
                 重做数=('is_remake', 'sum'),
                 重做率=('is_remake', 'mean')
             ).reset_index()
-            drink_remake = drink_remake[drink_remake['订单数'] >= 3].sort_values('重做率', ascending=False)
+            drink_remake = drink_remake.sort_values('重做率', ascending=False)
+            drink_remake['重做率%'] = drink_remake['重做率'] * 100
+            drink_remake['样本量'] = drink_remake['订单数'].apply(lambda x: '⚠️ 小样本' if x < 3 else '✅ 可信')
 
             if len(drink_remake) > 0:
-                drink_remake['重做率%'] = drink_remake['重做率'] * 100
                 fig_remake = px.bar(
                     drink_remake,
                     x='drink_name',
                     y='重做率%',
                     text='重做率%',
-                    hover_data=['订单数', '重做数'],
-                    title='各饮品重做率排行（订单数≥3）',
-                    color='重做率%',
-                    color_continuous_scale='Reds'
+                    hover_data=['订单数', '重做数', '样本量'],
+                    title='各饮品重做率排行（含全部饮品）',
+                    color='样本量',
+                    color_discrete_map={'✅ 可信': '#D2691E', '⚠️ 小样本': '#FFA07A'},
+                    pattern_shape='样本量',
+                    pattern_shape_map={'✅ 可信': '', '⚠️ 小样本': '/'}
                 )
                 fig_remake.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-                fig_remake.update_layout(height=450)
+                fig_remake.update_layout(height=450, legend_title='数据可靠性')
                 st.plotly_chart(fig_remake, use_container_width=True)
+
+                st.markdown("### 📋 饮品重做率详细表")
+                display_remake = drink_remake.copy()
+                display_remake['重做率%'] = display_remake['重做率%'].apply(lambda x: f"{x:.1f}%")
+                display_remake = display_remake[['drink_name', '订单数', '重做数', '重做率%', '样本量']]
+                display_remake.columns = ['饮品名称', '总订单数', '重做次数', '重做率', '数据可靠性']
+                st.dataframe(
+                    display_remake,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "数据可靠性": st.column_config.Column(
+                            "数据可靠性",
+                            width="small"
+                        )
+                    }
+                )
+                st.caption("⚠️ 小样本标记表示订单数少于3单，重做率可能不具备统计代表性")
             else:
-                st.info("订单数不足，暂不展示饮品重做率排行")
+                st.info("暂无饮品重做数据")
 
             daily_remake = valid_dated.groupby('date_only').agg(
                 订单数=('is_remake', 'count'),
@@ -879,7 +1260,8 @@ def main():
             "整体重做率": f"{remake_rate:.1f}%"
         }
 
-        html_report = generate_html_report(df_filtered, df, summary_metrics)
+        prep_suggestions = get_prep_suggestions(df_filtered)
+        html_report = generate_html_report(df_filtered, df, anomaly_df, summary_metrics, prep_suggestions)
         st.download_button(
             label="⬇️ 下载 HTML 报告",
             data=html_report.encode('utf-8'),
